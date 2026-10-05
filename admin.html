@@ -126,7 +126,7 @@
 <div id="editor-screen" class="page" style="display:none;">
   <div class="header">
     <h1>Edit page content</h1>
-    <a href="index.html" target="_blank">View live site →</a>
+    <a href="/" target="_blank">View live site →</a>
   </div>
 
   <div class="token-note">
@@ -311,14 +311,44 @@
 </div>
 
 <script>
-  // ── CONFIG ──
-  // The editor password is stored in Cloudflare (ADMIN_PASSWORD) and checked by the server.
-  // Repo owner/name live server-side in the Cloudflare Function.
-  const GITHUB_BRANCH = "main";
-  // GitHub token lives server-side in Cloudflare (see functions/api/github.js)
-  // — it is never present in this file, so nothing here is a secret.
+  // Edits are saved to Cloudflare KV storage, not GitHub.
+  // The editor password lives in Cloudflare (ADMIN_PASSWORD) and is checked by the server.
 
-  let pendingUploads = {}; // { targetTxtId: { filename, base64 } }
+  class ApiError extends Error {
+    constructor(message, status) {
+      super(message);
+      this.status = status;
+    }
+  }
+
+  let pendingUploads = {}; // { linkFieldId: { filename, file } }
+  let baseValues = {};     // the defaults stored in the repo's index.html
+
+  function adminFetch(query, options = {}) {
+    return fetch('/api/admin' + query, {
+      ...options,
+      headers: {
+        'X-Admin-Password': sessionStorage.getItem('editor-pw') || '',
+        ...(options.headers || {})
+      }
+    });
+  }
+
+  async function apiError(res) {
+    let msg = 'Error ' + res.status;
+    try {
+      const data = await res.json();
+      if (data && data.error) msg = data.error;
+    } catch (e) { /* keep default message */ }
+    return new ApiError(msg, res.status);
+  }
+
+  function labelFor(fid) {
+    const input = document.querySelector('[data-id="' + fid + '"]');
+    const field = input && input.closest('.field');
+    const label = field && field.querySelector('label');
+    return label ? label.textContent.replace(/\s+/g, ' ').trim() : fid;
+  }
 
   function showEditor() {
     document.getElementById('login-screen').style.display = 'none';
@@ -332,108 +362,76 @@
     const errEl = document.getElementById('login-error');
     errEl.style.display = 'none';
     try {
-      const res = await fetch('/api/github?check=1', { headers: { 'X-Admin-Password': input } });
+      const res = await fetch('/api/admin', { headers: { 'X-Admin-Password': input } });
       if (res.ok) {
         sessionStorage.setItem('editor-pw', input);
         showEditor();
-      } else if (res.status === 500) {
-        errEl.textContent = 'Editor is not set up yet (missing Cloudflare variables).';
-        errEl.style.display = 'block';
-      } else {
-        errEl.textContent = 'Incorrect password';
-        errEl.style.display = 'block';
+        return;
       }
+      errEl.textContent = res.status === 401 ? 'Incorrect password' : (await apiError(res)).message;
     } catch (e) {
       errEl.textContent = 'Could not reach the server. Check your connection.';
-      errEl.style.display = 'block';
     }
+    errEl.style.display = 'block';
   }
+
   document.getElementById('password-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') tryLogin();
   });
-  if (sessionStorage.getItem('editor-pw')) {
-    window.addEventListener('DOMContentLoaded', showEditor);
-  }
+  if (sessionStorage.getItem('editor-pw')) showEditor();
 
   function toggleSection(headEl) {
     headEl.parentElement.classList.toggle('open');
   }
 
   async function loadCurrentValues() {
+    const statusEl = document.getElementById('save-status');
     try {
-      const res = await fetch('index.html?_=' + Date.now());
-      const html = await res.text();
-      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const stamp = Date.now();
+      const [baseRes, curRes] = await Promise.all([
+        fetch('/?raw=1&_=' + stamp),
+        fetch('/?_=' + stamp)
+      ]);
+      const toDoc = async r => new DOMParser().parseFromString(await r.text(), 'text/html');
+      const [baseDoc, curDoc] = await Promise.all([toDoc(baseRes), toDoc(curRes)]);
+      const read = (doc, fid) => {
+        const el = doc.getElementById(fid);
+        if (!el) return null;
+        return fid.startsWith('link-') ? (el.getAttribute('href') || '') : el.textContent.trim();
+      };
       document.querySelectorAll('[data-id]').forEach(input => {
         const fid = input.dataset.id;
-        const el = doc.getElementById(fid);
-        if (!el) return;
-        if (fid.startsWith('link-')) {
-          input.value = el.getAttribute('href') || '';
-        } else {
-          input.value = el.textContent.trim();
-        }
+        const base = read(baseDoc, fid);
+        const cur = read(curDoc, fid);
+        if (base !== null) baseValues[fid] = base;
+        if (cur !== null) input.value = cur;
       });
     } catch (err) {
-      document.getElementById('save-status').textContent = 'Could not load current values — check your connection.';
-      document.getElementById('save-status').className = 'save-status err';
+      statusEl.textContent = 'Could not load current values. Check your connection.';
+      statusEl.className = 'save-status err';
     }
   }
 
   function handlePdfUpload(inputEl, defaultFilename, targetLinkId) {
     const file = inputEl.files[0];
-    const statusId = 'upload-status-' + inputEl.id.replace('upload-', '');
-    const statusEl = document.getElementById(statusId);
+    const statusEl = document.getElementById('upload-status-' + inputEl.id.replace('upload-', ''));
     if (!file) return;
-    if (file.type !== 'application/pdf') {
+    if (file.type !== 'application/pdf' && !/\.pdf$/i.test(file.name)) {
       statusEl.textContent = 'Please choose a PDF file.';
       statusEl.className = 'upload-status err';
       return;
     }
-    statusEl.textContent = 'Reading file…';
-    statusEl.className = 'upload-status';
-    const reader = new FileReader();
-    reader.onload = () => {
-      const base64 = reader.result.split(',')[1];
-      const filename = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-      pendingUploads[targetLinkId] = { filename, base64 };
-      const linkInput = document.querySelector('[data-id="' + targetLinkId + '"]');
-      if (linkInput) linkInput.value = filename;
-      statusEl.textContent = 'Ready — will upload "' + filename + '" when you save.';
-      statusEl.className = 'upload-status ok';
-    };
-    reader.onerror = () => {
-      statusEl.textContent = 'Could not read that file. Try again.';
+    if (file.size > 25 * 1024 * 1024) {
+      statusEl.textContent = 'That file is over 25 MB, which is the storage limit.';
       statusEl.className = 'upload-status err';
-    };
-    reader.readAsDataURL(file);
-  }
-
-  async function githubApi(path, options = {}) {
-    const method = options.method || 'GET';
-    const url = `/api/github?path=${encodeURIComponent(path)}`;
-    const res = await fetch(url, {
-      method,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Admin-Password': sessionStorage.getItem('editor-pw') || ''
-      },
-      body: options.body
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`Editor API ${res.status}: ${body}`);
+      return;
     }
-    return res.json();
-  }
-
-  function b64EncodeUnicode(str) {
-    return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g,
-      (match, p1) => String.fromCharCode('0x' + p1)));
-  }
-  function b64DecodeUnicode(str) {
-    return decodeURIComponent(atob(str).split('').map(c =>
-      '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+    const filename = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-100);
+    pendingUploads[targetLinkId] = { filename, file };
+    const linkInput = document.querySelector('[data-id="' + targetLinkId + '"]');
+    if (linkInput) linkInput.value = '/files/' + filename;
+    statusEl.textContent = 'Ready. "' + filename + '" uploads when you tap Save & Publish.';
+    statusEl.className = 'upload-status ok';
   }
 
   async function saveChanges() {
@@ -442,68 +440,46 @@
     statusEl.textContent = 'Saving…';
 
     try {
-      // 1. Upload any pending PDFs first
-      for (const [linkId, upload] of Object.entries(pendingUploads)) {
-        statusEl.textContent = `Uploading ${upload.filename}…`;
-        let sha = undefined;
-        try {
-          const existing = await githubApi(upload.filename);
-          sha = existing.sha;
-        } catch (e) { /* file doesn't exist yet, that's fine */ }
-        await githubApi(upload.filename, {
+      // 1. Upload any new files first
+      for (const upload of Object.values(pendingUploads)) {
+        statusEl.textContent = 'Uploading ' + upload.filename + '…';
+        const res = await adminFetch('?type=file&name=' + encodeURIComponent(upload.filename), {
           method: 'PUT',
-          body: JSON.stringify({
-            message: `Update ${upload.filename} via editor`,
-            content: upload.base64,
-            branch: GITHUB_BRANCH,
-            ...(sha ? { sha } : {})
-          })
+          body: upload.file
         });
+        if (!res.ok) throw await apiError(res);
       }
 
-      // 2. Fetch current index.html
-      statusEl.textContent = 'Fetching current page…';
-      const current = await githubApi('index.html');
-      let html = b64DecodeUnicode(current.content.replace(/\n/g, ''));
-
-      // 3. Apply every field edit
-      statusEl.textContent = 'Applying changes…';
+      // 2. Only fields that differ from the page defaults are stored
+      const edits = {};
       document.querySelectorAll('[data-id]').forEach(input => {
         const fid = input.dataset.id;
-        const newVal = input.value;
-
-        if (fid.startsWith('link-')) {
-          const re = new RegExp(`(id="${fid}"[^>]*href=")[^"]*(")`);
-          const reAlt = new RegExp(`(href=")[^"]*("[^>]*id="${fid}")`);
-          if (re.test(html)) {
-            html = html.replace(re, `$1${newVal}$2`);
-          } else if (reAlt.test(html)) {
-            html = html.replace(reAlt, `$1${newVal}$2`);
-          }
-        } else {
-          const re = new RegExp(`(id="${fid}"[^>]*>)[^<]*(<)`);
-          html = html.replace(re, `$1${newVal}$2`);
-        }
+        if (!(fid in baseValues)) return;
+        const val = input.value.trim();
+        if (val !== baseValues[fid]) edits[fid] = val;
       });
 
-      // 4. Commit updated index.html
+      // 3. Publish
       statusEl.textContent = 'Publishing…';
-      await githubApi('index.html', {
+      const res = await adminFetch('?type=content', {
         method: 'PUT',
-        body: JSON.stringify({
-          message: 'Update content via editor',
-          content: b64EncodeUnicode(html),
-          branch: GITHUB_BRANCH,
-          sha: current.sha
-        })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(edits)
       });
+      if (!res.ok) throw await apiError(res);
 
       pendingUploads = {};
-      statusEl.textContent = '✓ Saved! Live in about a minute.';
+      statusEl.textContent = '✓ Saved. Live in about a minute.';
       statusEl.className = 'save-status ok';
     } catch (err) {
       console.error(err);
-      statusEl.textContent = 'Something went wrong — nothing was lost, try saving again.';
+      let msg = err && err.message ? err.message : 'Something went wrong.';
+      if (err && err.status === 401) {
+        sessionStorage.removeItem('editor-pw');
+        msg = 'Password no longer accepted. Reload the page and log in again.';
+      }
+      msg = msg.replace(/\b((?:txt|link)-[a-z0-9-]+)\b/g, (m, fid) => '"' + labelFor(fid) + '"');
+      statusEl.textContent = 'Not saved: ' + msg;
       statusEl.className = 'save-status err';
     }
   }
