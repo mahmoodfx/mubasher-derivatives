@@ -312,7 +312,7 @@
 
 <script>
   // ── CONFIG ──
-  const EDITOR_PASSWORD = "MC2027"; // Change this by editing this file directly on GitHub
+  // The editor password is stored in Cloudflare (ADMIN_PASSWORD) and checked by the server.
   // Repo owner/name live server-side in the Cloudflare Function.
   const GITHUB_BRANCH = "main";
   // GitHub token lives server-side in Cloudflare (see functions/api/github.js)
@@ -320,26 +320,39 @@
 
   let pendingUploads = {}; // { targetTxtId: { filename, base64 } }
 
-  function tryLogin() {
+  function showEditor() {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('editor-screen').style.display = 'block';
+    document.getElementById('save-bar').style.display = 'block';
+    loadCurrentValues();
+  }
+
+  async function tryLogin() {
     const input = document.getElementById('password-input').value;
-    if (input === EDITOR_PASSWORD) {
-      document.getElementById('login-screen').style.display = 'none';
-      document.getElementById('editor-screen').style.display = 'block';
-      document.getElementById('save-bar').style.display = 'block';
-      loadCurrentValues();
-      sessionStorage.setItem('editor-unlocked', '1');
-    } else {
-      document.getElementById('login-error').style.display = 'block';
+    const errEl = document.getElementById('login-error');
+    errEl.style.display = 'none';
+    try {
+      const res = await fetch('/api/github?check=1', { headers: { 'X-Admin-Password': input } });
+      if (res.ok) {
+        sessionStorage.setItem('editor-pw', input);
+        showEditor();
+      } else if (res.status === 500) {
+        errEl.textContent = 'Editor is not set up yet (missing Cloudflare variables).';
+        errEl.style.display = 'block';
+      } else {
+        errEl.textContent = 'Incorrect password';
+        errEl.style.display = 'block';
+      }
+    } catch (e) {
+      errEl.textContent = 'Could not reach the server. Check your connection.';
+      errEl.style.display = 'block';
     }
   }
   document.getElementById('password-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') tryLogin();
   });
-  if (sessionStorage.getItem('editor-unlocked') === '1') {
-    document.getElementById('login-screen').style.display = 'none';
-    document.getElementById('editor-screen').style.display = 'block';
-    document.getElementById('save-bar').style.display = 'block';
-    window.addEventListener('DOMContentLoaded', loadCurrentValues);
+  if (sessionStorage.getItem('editor-pw')) {
+    window.addEventListener('DOMContentLoaded', showEditor);
   }
 
   function toggleSection(headEl) {
@@ -401,7 +414,10 @@
     const url = `/api/github?path=${encodeURIComponent(path)}`;
     const res = await fetch(url, {
       method,
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Password': sessionStorage.getItem('editor-pw') || ''
+      },
       body: options.body
     });
     if (!res.ok) {
